@@ -92,14 +92,17 @@ public class TextImportTransform extends PTransform<PBegin, PDone> {
 
   private final ValueProvider<String> importManifest;
   private final ValueProvider<String> invalidOutputPath;
+  private final boolean upsertMode;
 
   public TextImportTransform(
       SpannerConfig spannerConfig,
       ValueProvider<String> importManifest,
-      ValueProvider<String> invalidOutputPath) {
+      ValueProvider<String> invalidOutputPath,
+      boolean upsertMode) {
     this.spannerConfig = spannerConfig;
     this.importManifest = importManifest;
     this.invalidOutputPath = invalidOutputPath;
+    this.upsertMode = upsertMode;
   }
 
   @Override
@@ -168,6 +171,8 @@ public class TextImportTransform extends PTransform<PBegin, PDone> {
                     }));
 
     PCollection<?> previousComputation = ddl;
+    Boolean rootDepthLevel = true;
+    PCollection<String> readWriteOutput = null;
     for (int i = 0; i < MAX_DEPTH; i++) {
       final int depth = i;
       PCollection<KV<String, String>> levelFileToTables =
@@ -191,26 +196,46 @@ public class TextImportTransform extends PTransform<PBegin, PDone> {
                       })
                   .withSideInputs(levelsView));
 
-      PCollection<Mutation> mutations =
-          levelFileToTables
-              .apply("Reshuffle text files " + depth, Reshuffle.viaRandomKey())
-              .apply(
-                  "Text files as mutations. Depth: " + depth,
-                  new TextTableFilesAsMutations(ddlView, tableColumnsView));
+      if (upsertMode) {
+        if (rootDepthLevel) {
+          readWriteOutput =
+              levelFileToTables
+                  .apply("Reshuffle text files " + depth, Reshuffle.viaRandomKey())
+                  .apply(
+                      "Text files as read/write. Depth: " + depth,
+                      new TextTableFilesToReadWrite(ddlView, tableColumnsView));
+        } else {
+          readWriteOutput =
+              levelFileToTables
+                  .apply("Wait for previous depth " + depth, Wait.on(readWriteOutput))
+                  .apply("Reshuffle text files " + depth, Reshuffle.viaRandomKey())
+                  .apply(
+                      "Text files as read/write. Depth: " + depth,
+                      new TextTableFilesToReadWrite(ddlView, tableColumnsView));
+        }
+        rootDepthLevel = false;
+      } else {
+        PCollection<Mutation> mutations =
+            levelFileToTables
+                .apply("Reshuffle text files " + depth, Reshuffle.viaRandomKey())
+                .apply(
+                    "Text files as mutations. Depth: " + depth,
+                    new TextTableFilesAsMutations(ddlView, tableColumnsView));
 
-      SpannerWriteResult result =
-          mutations
-              .apply("Wait for previous depth " + depth, Wait.on(previousComputation))
-              .apply(
-                  "Write mutations " + depth,
-                  LocalSpannerIO.write()
-                      .withSpannerConfig(spannerConfig)
-                      .withCommitDeadline(Duration.standardMinutes(1))
-                      .withMaxCumulativeBackoff(Duration.standardHours(2))
-                      .withMaxNumMutations(10000)
-                      .withGroupingFactor(100)
-                      .withDialectView(dialectView));
-      previousComputation = result.getOutput();
+        SpannerWriteResult result =
+            mutations
+                .apply("Wait for previous depth " + depth, Wait.on(previousComputation))
+                .apply(
+                    "Write mutations " + depth,
+                    LocalSpannerIO.write()
+                        .withSpannerConfig(spannerConfig)
+                        .withCommitDeadline(Duration.standardMinutes(1))
+                        .withMaxCumulativeBackoff(Duration.standardHours(2))
+                        .withMaxNumMutations(10000)
+                        .withGroupingFactor(100)
+                        .withDialectView(dialectView));
+        previousComputation = result.getOutput();
+      } // if/else
     }
 
     return PDone.in(begin.getPipeline());
@@ -298,6 +323,92 @@ public class TextImportTransform extends PTransform<PBegin, PDone> {
                   .withNumShards(1));
 
       return outputCollections.get(mutationTag);
+    }
+  }
+
+  /** A transform that upserts CSV records to Cloud Spanner. */
+  private class TextTableFilesToReadWrite
+      extends PTransform<PCollection<KV<String, String>>, PCollection<String>> {
+
+    private final PCollectionView<Ddl> ddlView;
+    private final PCollectionView<Map<String, List<TableManifest.Column>>> tableColumnsView;
+
+    public TextTableFilesToReadWrite(
+        PCollectionView<Ddl> ddlView,
+        PCollectionView<Map<String, List<TableManifest.Column>>> tableColumnsView) {
+      this.ddlView = ddlView;
+      this.tableColumnsView = tableColumnsView;
+    }
+
+    @Override
+    public PCollection<String> expand(PCollection<KV<String, String>> filesToTables) {
+      // Map<filename,tablename>
+      PCollectionView<Map<String, String>> filesToTablesMapView =
+          filesToTables.apply("asView", View.asMap());
+      TextImportPipeline.Options options =
+          filesToTables.getPipeline().getOptions().as(TextImportPipeline.Options.class);
+
+      TupleTag<String> errorTag = new TupleTag<>() {};
+      TupleTag<String> resultTag = new TupleTag<>() {};
+
+      PCollectionTuple outputCollections =
+          filesToTables
+              .apply("Get Filenames", Keys.create())
+              // PCollection<String>
+              .apply(FileIO.matchAll().withEmptyMatchTreatment(EmptyMatchTreatment.DISALLOW))
+              // PCollection<Match.Metadata>
+              .apply(FileIO.readMatches())
+              // PCollection<FileIO.ReadableFile>
+              .apply(
+                  "Split into ranges",
+                  ParDo.of(
+                          new SplitIntoRangesFn(
+                              SplitIntoRangesFn.DEFAULT_BUNDLE_SIZE,
+                              filesToTablesMapView,
+                              options.getFieldQualifier(),
+                              options.getColumnDelimiter(),
+                              options.getEscape(),
+                              options.getHandleNewLine()))
+                      .withSideInputs(filesToTablesMapView))
+              .setCoder(Coder.of())
+              // PCollection<FileShard>
+              .apply("Reshuffle", Reshuffle.viaRandomKey())
+              // PCollection<FileShard>
+              .apply(
+                  "Read lines",
+                  ParDo.of(
+                      new ReadFileShardFn(
+                          options.getColumnDelimiter(),
+                          options.getFieldQualifier(),
+                          options.getTrailingDelimiter(),
+                          options.getEscape(),
+                          options.getNullString(),
+                          options.getHandleNewLine())))
+              // PCollection<KV<String, CSVRecord>>: tableName, row
+              .apply(
+                  ParDo.of(
+                          new SpannerReadWriteFn(
+                              ddlView,
+                              tableColumnsView,
+                              options.getDateFormat(),
+                              options.getTimestampFormat(),
+                              options.getInvalidOutputPath(),
+                              errorTag,
+                              spannerConfig))
+                      .withOutputTags(resultTag, TupleTagList.of(errorTag))
+                      .withSideInputs(ddlView, tableColumnsView));
+
+      // Need to use writeCustomType to avoid errors when output path is not given
+      outputCollections
+          .get(errorTag)
+          .apply(
+              TextIO.<String>writeCustomType()
+                  .to(options.getInvalidOutputPath())
+                  .skipIfEmpty()
+                  .withFormatFunction(SerializableFunctions.identity())
+                  .withNumShards(1));
+
+      return outputCollections.get(resultTag);
     }
   }
 

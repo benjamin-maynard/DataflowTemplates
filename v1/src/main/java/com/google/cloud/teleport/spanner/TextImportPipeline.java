@@ -293,6 +293,13 @@ public class TextImportPipeline {
     ValueProvider<String> getInvalidOutputPath();
 
     void setInvalidOutputPath(ValueProvider<String> value);
+
+    @TemplateCreationParameter(value = "false")
+    @Description("If true, does not write row if PK already exists.")
+    @Default.Boolean(true)
+    boolean getUpsertMode();
+
+    void setUpsertMode(boolean value);
   }
 
   public static void main(String[] args) {
@@ -321,7 +328,10 @@ public class TextImportPipeline {
 
     p.apply(
         new TextImportTransform(
-            spannerConfig, options.getImportManifest(), options.getInvalidOutputPath()));
+            spannerConfig,
+            options.getImportManifest(),
+            options.getInvalidOutputPath(),
+            options.getUpsertMode()));
 
     PipelineResult result = p.run();
     if (options.getWaitUntilFinish()
